@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+import time
+import sys
+import json
+from threading import Thread
+import fcntl
+import os
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+FORMAT = "{artist} - {title}"
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+players = dict()
+active_player = ""
+
+""" When any of these properties change, a refresh of the block is triggered """
+TRIGGER = set(["PlaybackStatus", "Metadata"])
+
+
+def get_active_player():
+    """ Returns currently active player, or None if there are no players """
+
+    if len(players) == 0:
+        return None
+
+    for player in players.values():
+        if player.is_active():
+            return player
+
+    # If there are no active players yet, set the first one as active and return it
+    player = list(players.values())[0]
+    player.set_active()
+    return player
+
+
+def trigger_refresh():
+    """ Called when we must refresh output text (current track being played) """
+
+    player = get_active_player()
+    if player:
+        caption = str(player)
+    else:
+        # can't be an empty string, or i3blocks won't consume it
+        caption = " "
+
+    sys.stdout.write("{}\n".format(caption))
+    sys.stdout.flush()
+
+
+class Player():
+
+    def __init__(self, name):
+        self.name = name
+        self.object = bus.get_object(name, "/org/mpris/MediaPlayer2")
+        self.iface = dbus.Interface(self.object, "org.mpris.MediaPlayer2.Player")
+        self.props_iface = dbus.Interface(self.object, "org.freedesktop.DBus.Properties")
+        self.props_iface.connect_to_signal("PropertiesChanged", self.changed, dbus_interface="org.freedesktop.DBus.Properties")
+        self.props = self.props_iface.GetAll("org.mpris.MediaPlayer2.Player")
+
+    def changed(self, iface, changed, invalidated):
+        if iface != "org.mpris.MediaPlayer2.Player":
+            return
+        self.props.update(changed)
+
+        # If the playback status was changed, and this player is now playing, set it as the active player
+        if "PlaybackStatus" in changed and self.playing():
+            self.set_active()
+
+        # If any of the keys that can change our caption are present, trigger a refresh
+        if len(set(self.props.keys()) and TRIGGER) > 0:
+            trigger_refresh()
+
+    def set_active(self):
+        global active_player
+        active_player = self.name
+
+    def is_active(self):
+        return active_player == self.name
+
+    def artist(self):
+        return ", ".join(self.props["Metadata"].get("xesam:artist", []))
+
+    def title(self):
+        return self.props["Metadata"].get("xesam:title", "")
+
+    def status(self):
+        # XXX: reading self.props returns invalid data for Serranya/deadbeef-mpris2-plugin ("Playing" while it's paused, on launch)
+        # XXX: but where's the bug?
+        return self.props_iface.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+
+    def playing(self):
+        return self.status() == "Playing"
+
+    def paused(self):
+        return self.status() == "Paused"
+
+    def stopped(self):
+        return self.status() == "Stopped"
+
+    def prev(self):
+        self.iface.Previous()
+
+    def next(self):
+        self.iface.Next()
+
+    def play_pause(self):
+        self.iface.PlayPause()
+
+    def __str__(self):
+        kwargs = dict(
+            artist=self.artist(),
+            title=self.title(),
+        )
+        return FORMAT.format(**kwargs)
+
+
+def player_add(name):
+    players[name] = Player(name)
+
+
+def player_remove(name):
+    del players[name]
+
+
+def is_mpris_name(name):
+    return name.startswith("org.mpris.MediaPlayer2.")
+
+
+def name_owner_changed(name, old_owner, new_owner):
+    if not is_mpris_name(name):
+        return
+    if new_owner and not old_owner:
+        player_add(name)
+    elif old_owner and not new_owner:
+        player_remove(name)
+
+    trigger_refresh()
+
+
+def handle_click(data):
+    if "button" not in data:
+        return
+
+    player = get_active_player()
+    if player is None:
+        return
+
+    btn = data["button"]
+    if btn == 1:
+        player.next()
+    elif btn == 2:
+        player.play_pause()
+    elif btn == 3:
+        player.prev()
+
+
+def stdin_handler():
+    fd = sys.stdin.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fl &= ~os.O_NONBLOCK
+    fl &= ~os.O_ASYNC
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl)
+
+    while True:
+        inp = sys.stdin.readline()
+        # We get some weird stuff (not sure why), like:
+        # - '['
+        # - ',{json}'
+        # - ',{json}\n'
+        # attempt to handle all of the cases here...
+
+        left = inp.find("{")
+        right = inp.rfind("}")
+        if left == -1 or right == -1:
+            continue
+
+        data = inp[left:right+1]
+        data = json.loads(data)
+
+        handle_click(data)
+
+
+def main():
+    bus.add_signal_receiver(name_owner_changed, signal_name='NameOwnerChanged')
+    for name in bus.list_names():
+        if is_mpris_name(name):
+            player_add(name)
+    trigger_refresh()
+    Thread(target=stdin_handler).start()
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()
